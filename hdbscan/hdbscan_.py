@@ -91,6 +91,248 @@ def _tree_to_labels(
     return (labels, probabilities, stabilities, condensed_tree, single_linkage_tree)
 
 
+def _hdbscan_vector_cloud(
+    X,
+    min_samples=5,
+    alpha=1.0,
+    metric="minkowski",
+    p=2,
+    leaf_size=None,
+    gen_min_span_tree=False,
+    **kwargs
+):
+    angle_impact = kwargs.pop("angle_impact", 2)
+    angle_sensitivity = kwargs.pop("angle_sensitivity", 10)
+    angle_coef_min = kwargs.pop("angle_coef_min", 0.01)
+    angle_coef_max = kwargs.pop("angle_coef_max", 100)
+    arg_view = dict(
+        metric=metric,
+        angle_impact=angle_impact,
+        angle_sensitivity=angle_sensitivity,
+        angle_coef_min=angle_coef_min,
+        angle_coef_max=angle_coef_max,
+        min_samples=min_samples,
+    ) | kwargs
+    # print(f"_hdbscan_vector_cloud: Parameters are {arg_view}")
+    assert X.shape[1] == 3, "Data must have 3 dimensions (x, y, angle)"
+    converted_X = np.radians(X)  # lat/lon are in degrees, and heading is also in degrees
+    pos_X, rad_X = converted_X.T[:2].T, converted_X.T[2]
+    uv_X = np.column_stack([np.sin(rad_X), np.cos(rad_X)])  # convert headings in radians into x/y units
+
+    # PHYSICAL DISTANCE
+    if metric == "haversine":
+        # print("_hdbscan_vector_cloud: Using Haversine distance...")
+        # print(f"_hdbscan_vector_cloud: pos_X shape is {pos_X.shape}")
+        # added Haversine distance -- otherwise not supported in sklearn pairwise_distances
+        physical_dist_matrix = DistanceMetric.get_metric("haversine").pairwise(pos_X)
+        # print(f"_hdbscan_vector_cloud: physical_dist_matrix shape is {physical_dist_matrix.shape}")
+    elif metric == "minkowski":
+        physical_dist_matrix = pairwise_distances(X.T[:2].T, metric=metric, p=p)
+    elif metric == "arccos":
+        physical_dist_matrix = pairwise_distances(X.T[:2].T, metric="cosine", **kwargs)
+    elif metric == "precomputed":
+        raise TypeError("Precomputed distance matrices not yet supported")
+        # # Treating this case explicitly, instead of letting
+        # #   sklearn.metrics.pairwise_distances handle it,
+        # #   enables the usage of numpy.inf in the distance
+        # #   matrix to indicate missing distance information.
+        # # TODO: Check if copying is necessary
+        # distance_matrix = X.copy()
+    else:
+        physical_dist_matrix = pairwise_distances(X.T[:2].T, metric=metric, **kwargs)
+
+    # HEADING DISTANCE
+    # How similar the angles of two vectors are
+    # print("_hdbscan_vector_cloud: Calculating cosine similarity...")
+    # print(f"_hdbscan_vector_cloud: uv_X shape is {uv_X.shape}")
+    angle_dist_matrix = pairwise_distances(uv_X, metric="cosine", **kwargs)
+    # print(f"_hdbscan_vector_cloud: angle_dist_matrix shape is {angle_dist_matrix.shape}")
+
+    # FULL DISTANCE METRIC
+    angle_coefficient = np.clip((angle_sensitivity * angle_dist_matrix) ** angle_impact, angle_coef_min, angle_coef_max)
+    # print(f"_hdbscan_vector_cloud: angle_coefficient's range is {angle_coefficient.min(), angle_coefficient.max()}")
+    distance_matrix = physical_dist_matrix * angle_coefficient
+    # print(f"_hdbscan_vector_cloud: distance_matrix shape is {distance_matrix.shape}")
+
+    if issparse(distance_matrix):
+        raise TypeError('Sparse distance matrices not yet supported')
+        # return _hdbscan_sparse_distance_matrix(
+        #     distance_matrix,
+        #     min_samples,
+        #     alpha,
+        #     metric,
+        #     p,
+        #     leaf_size,
+        #     gen_min_span_tree,
+        #     **kwargs
+        # )
+
+    # print("_hdbscan_vector_cloud: Calculating mutual reachability...")
+    mutual_reachability_ = mutual_reachability(distance_matrix, min_samples, alpha)
+
+    # print("_hdbscan_vector_cloud: Constructing MST...")
+    min_spanning_tree = mst_linkage_core(mutual_reachability_)
+
+    # Warn if the MST couldn't be constructed around the missing distances
+    if np.isinf(min_spanning_tree.T[2]).any():
+        warn(
+            "The minimum spanning tree contains edge weights with value "
+            "infinity. Potentially, you are missing too many distances "
+            "in the initial distance matrix for the given neighborhood "
+            "size.",
+            UserWarning,
+        )
+
+    # mst_linkage_core does not generate a full minimal spanning tree
+    # If a tree is required then we must build the edges from the information
+    # returned by mst_linkage_core (i.e. just the order of points to be merged)
+    if gen_min_span_tree:
+        result_min_span_tree = min_spanning_tree.copy()
+        for index, row in enumerate(result_min_span_tree[1:], 1):
+            candidates = np.where(isclose(mutual_reachability_[int(row[1])], row[2]))[0]
+            candidates = np.intersect1d(
+                candidates, min_spanning_tree[:index, :2].astype(int)
+            )
+            candidates = candidates[candidates != row[1]]
+            assert len(candidates) > 0
+            row[0] = candidates[0]
+    else:
+        result_min_span_tree = None
+
+    # print("_hdbscan_vector_cloud: Sorting MST...")
+    # Sort edges of the min_spanning_tree by weight
+    min_spanning_tree = min_spanning_tree[np.argsort(min_spanning_tree.T[2]), :]
+
+    # print("_hdbscan_vector_cloud: Creating single linkage tree...")
+    # Convert edge list into standard hierarchical clustering format
+    single_linkage_tree = label(min_spanning_tree)
+
+    # print("_hdbscan_vector_cloud: Done!")
+    return single_linkage_tree, result_min_span_tree
+
+
+# TODO: Clean up this mess
+def _hdbscan_prims_kdtree_vc(
+    X,
+    min_samples=5,
+    alpha=1.0,
+    metric="euclidean",
+    p=2,  # unused
+    leaf_size=40,
+    gen_min_span_tree=False,
+    **kwargs
+):
+    angle_scale = kwargs.pop("angle_scale", "auto")
+    lookahead_sensitivity = kwargs.pop("lookahead_sensitivity", 0)
+
+    # print("Running _hdbscan_prims_kdtree_vc")
+    if X.dtype != np.float64:
+        X = X.astype(np.float64)
+
+    # The Cython routines used require contiguous arrays
+    if not X.flags["C_CONTIGUOUS"]:
+        X = np.array(X, dtype=np.double, order="C")
+
+    # expect Euclidean metric
+    assert metric == "euclidean", "VecCloud only works with Euclidean metric currently"
+    # expect 3 dimensional data
+    assert X.shape[1] == 3, "Data must have 3 dimensions (x, y, angle)"
+
+    # DATA TRANSFORMATIONS
+    # print("_hdbscan_prims_kdtree_vc: Transforming data with angle_scale", angle_scale)
+    # go to column format [[xx...], [yy...], [aa...]]
+    X = X.T
+    X_2 = X.copy()
+
+    # save the original headings
+    headings = X[2].copy()
+
+    # to get around the problem of wrap-around at 0 degrees/radians, we create two trees:
+    # one translated by half-circle (180 deg); then, at least one tree is guaranteed correct.
+    # to figure out which one to use, we just check which hemisphere the original angle is in
+    # if original angle is in bottom hemisphere (>90, <270), then use X (original)
+    # if original angle is in top hemisphere (<90, >270), then use X_2 (translated)
+    X_2[2] += 180  # still in degrees; shift all by 180 deg
+    X_2[2] %= 360  # mod 360 to wrap around
+    # also, we need to scale the headings to the same scale as the lat/lon data
+    # in order for KDTree to fairly compare distances
+    X[2] = (X[2] - X[2].min()) / (X[2].max() - X[2].min())  # transform to [0,1]
+    X_2[2] = (X_2[2] - X_2[2].min()) / (X_2[2].max() - X_2[2].min())  # transform to [0,1]
+    if angle_scale == "auto":
+        # calculate new scale based on lat/lon data
+        angle_scale = max(X[0].max() - X[0].min(), X[1].max() - X[1].min())
+    else:
+        if not (type(angle_scale) == int or type(angle_scale) == float):
+            raise TypeError("angle_scale should be numeric!")
+    # apply new scale
+    X[2] = X[2] * angle_scale
+    X_2[2] = X_2[2] * angle_scale
+
+    # calculate lookahead arrays
+    # these will be used to query the KDTrees
+    lookahead_scale = lookahead_sensitivity * angle_scale  # scale it to match existing scale
+    lon_lookahead = lookahead_scale * np.sin(headings)
+    lat_lookahead = lookahead_scale * np.cos(headings)
+    lookahead_X = X.copy()
+    lookahead_X_2 = X_2.copy()
+    lookahead_X[0] += lon_lookahead
+    lookahead_X[1] += lat_lookahead
+    lookahead_X_2[0] += lon_lookahead
+    lookahead_X_2[1] += lat_lookahead
+
+    # go back to row format [[xya], [xya], ...]
+    X = X.T
+    X_2 = X_2.T
+    lookahead_X = lookahead_X.T
+    lookahead_X_2 = lookahead_X_2.T
+
+    # FINISH DATA TRANSFORMATIONS
+
+    # BUILD KD TREES
+    # print("_hdbscan_prims_kdtree_vc: Building KD trees...")
+    tree_1 = KDTree(X, metric=metric, leaf_size=leaf_size, **kwargs)
+    tree_2 = KDTree(X_2, metric=metric, leaf_size=leaf_size, **kwargs)
+    dist_metric = DistanceMetric.get_metric(metric, **kwargs)
+
+    # QUERY KD TREES
+    # Use heuristic to figure out which KDTree to use
+    # If mask is true, then use tree_1
+    tree1_mask = (headings > 90) & (headings <= 270)
+    tree2_mask = ~tree1_mask
+
+    # print("_hdbscan_prims_kdtree_vc: Querying KD trees with lookahead of", lookahead_sensitivity)
+    # Get distance to kth nearest neighbour in both trees
+    dists_1 = tree_1.query(
+        lookahead_X[tree1_mask], k=min_samples + 1, dualtree=True, breadth_first=True
+    )[0][:, -1]
+    dists_2 = tree_2.query(
+        lookahead_X_2[tree2_mask], k=min_samples + 1, dualtree=True, breadth_first=True
+    )[0][:, -1]
+    core_distances = np.zeros(len(headings))
+    core_distances[tree1_mask] = dists_1
+    core_distances[tree2_mask] = dists_2
+    core_distances = core_distances.copy(order="C")
+
+    # THE REST OF HDBSCAN
+    # print("_hdbscan_prims_kdtree_vc: Building MST...")
+    # Mutual reachability distance is implicit in mst_linkage_core_vector
+    min_spanning_tree = mst_linkage_core_vector(X, core_distances, dist_metric, alpha)
+
+    # print("_hdbscan_prims_kdtree_vc: Sorting MST...")
+    # Sort edges of the min_spanning_tree by weight
+    min_spanning_tree = min_spanning_tree[np.argsort(min_spanning_tree.T[2]), :]
+
+    # print("_hdbscan_prims_kdtree_vc: Converting MST...")
+    # Convert edge list into standard hierarchical clustering format
+    single_linkage_tree = label(min_spanning_tree)
+
+    # print("_hdbscan_prims_kdtree_vc: Done!")
+    if gen_min_span_tree:
+        return single_linkage_tree, min_spanning_tree
+    else:
+        return single_linkage_tree, None
+
+
 def _hdbscan_generic(
     X,
     min_samples=5,
@@ -129,7 +371,6 @@ def _hdbscan_generic(
         )
 
     mutual_reachability_ = mutual_reachability(distance_matrix, min_samples, alpha)
-
     min_spanning_tree = mst_linkage_core(mutual_reachability_)
 
     # Warn if the MST couldn't be constructed around the missing distances
@@ -809,6 +1050,10 @@ def hdbscan(
                 core_dist_n_jobs,
                 **kwargs
             )
+        elif algorithm == "vector_cloud":
+            (single_linkage_tree, result_min_span_tree) = memory.cache(
+                _hdbscan_prims_kdtree_vc
+            )(X, min_samples, alpha, metric, p, leaf_size, gen_min_span_tree, **kwargs)
         else:
             raise TypeError("Unknown algorithm type %s specified" % algorithm)
     else:
